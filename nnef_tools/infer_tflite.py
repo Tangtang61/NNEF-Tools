@@ -31,6 +31,7 @@ import shutil
 
 import tensorflow as tf
 import numpy as np
+import nnef
 
 from nnef_tools.core import utils
 from nnef_tools.io.nnef import nnef_io
@@ -64,20 +65,6 @@ please add its location to PYTHONPATH.
                         help="The path of the output directory.\n"
                              "By default the standard output is used, but only if the command is piped or redirected.")
 
-    #     parser.add_argument("--output-names",
-    #                         nargs='*',
-    #                         help="""List tensor names to ensure that those tensors are exported.
-    # If this option is not specified the graph's output tensors are exported.
-    # --output-names: Export nothing
-    # --output-names a b c: Export the tensors a, b and c
-    # --output-names '*': Export all activation tensors
-    #  """)
-
-    #     parser.add_argument("--device",
-    #                         required=False,
-    #                         help="""Set device: cpu, cuda, cuda:0, cuda:1, etc.
-    # Default: cuda if available, cpu otherwise.""")
-
     args = parser.parse_args()
 
     has_weights = not (os.path.isfile(args.network) and not args.network.endswith('.tgz'))
@@ -88,35 +75,85 @@ please add its location to PYTHONPATH.
     return args
 
 
-def run_tflite_model(model_path, input_np):
+def run_tflite_model(model_path, inputs_np):
+    if not isinstance(inputs_np, (list, tuple)):
+        inputs_np = (inputs_np,)
     interpreter = (tf.lite.Interpreter if hasattr(tf, "lite") else tf.contrib.lite.Interpreter)(model_path=model_path)
     interpreter.allocate_tensors()
-
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    interpreter.set_tensor(input_details[0]['index'], input_np)
+    for input_detail, input_np in zip(interpreter.get_input_details(), inputs_np):
+        interpreter.set_tensor(input_detail['index'], input_np)
     interpreter.invoke()
+    return tuple(interpreter.get_tensor(output_detail['index']) for output_detail in interpreter.get_output_details())
 
-    return interpreter.get_tensor(output_details[0]['index'])
+
+def transform_input(input_np):
+    input_np = input_np[:1]  # HACK
+
+    rank = len(input_np.shape)
+    if rank >= 3:
+        return np.transpose(input_np, (0,) + tuple(range(2, rank)) + (1,))
+    return input_np
+
+
+def transform_output(output_np):
+    rank = len(output_np.shape)
+    if rank >= 3:
+        return np.transpose(output_np, (0, rank - 1) + tuple(range(1, rank - 1)))
+    return output_np
 
 
 def main():
     args = get_args()
+
+    if args.input is None:
+        if sys.stdin.isatty():
+            raise utils.NNEFToolsException("No input provided!")
+        utils.set_stdin_to_binary()
+
+    if args.output is None:
+        if sys.stdout.isatty():
+            raise utils.NNEFToolsException("No output provided!")
+        utils.set_stdout_to_binary()
+
     nnef_graph = nnef_io.Reader([NNEFParserConfig.STANDARD_CONFIG, nnef_to_tf.ParserConfig])(args.network)
+    input_names = [t.name for t in nnef_graph.inputs]
+    output_names = [t.name for t in nnef_graph.outputs]
+
     tf_graph, _ = nnef_to_tf.Converter()(nnef_graph)
+    del nnef_graph
+
     TFDataFormatOptimizer(io_transform=IOTransform.SMART_NCHW_TO_NHWC, merge_transforms_into_variables=True)(tf_graph)
+
     dir = tempfile.mkdtemp(prefix="nnef_")
+
     try:
         tflite_path = os.path.join(dir, "network.tflite")
         tflite_io.Writer(convert_from_tf_py=True)(tf_graph, tflite_path)
-        assert len(args.input) == 1
-        input_np = np.transpose(nnef_io.read_nnef_tensor(args.input[0]), (0, 2, 3, 1))[2:3]
-        output = run_tflite_model(tflite_path, input_np)
-        print(np.argmax(output, axis=1))
+        del tf_graph
+
+        if args.input is None:
+            inputs = tuple(nnef.read_tensor(sys.stdin)[0] for _ in range(len(input_names)))
+        elif len(args.input) == 1 and os.path.isdir(args.input[0]):
+            inputs = tuple(nnef_io.read_nnef_tensor(os.path.join(args.input[0], input_name + '.dat'))
+                           for input_name in input_names)
+        else:
+            inputs = tuple(nnef_io.read_nnef_tensor(path) for path in args.input)
+
+        outputs = run_tflite_model(tflite_path, tuple(transform_input(input) for input in inputs))
+        del inputs
+
+        if args.output is None:
+            for output in outputs:
+                nnef.write_tensor(sys.stdout, output)
+        else:
+            for output_name, output in zip(output_names, outputs):
+                output_path = os.path.join(args.output, output_name + '.dat')
+                nnef_io.write_nnef_tensor(output_path, transform_output(output))
     finally:
         shutil.rmtree(dir)
 
 
 if __name__ == '__main__':
     main()
+
+# Tested on networks/inception_v2.nnef
